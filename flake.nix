@@ -14,7 +14,7 @@
         sws = pkgs.static-web-server;
         appClosure = pkgs.buildEnv {
           name = "jazz-hands-closure";
-          paths = [ sws siteDir ];
+          paths = [ sws ];
         };
       in
       {

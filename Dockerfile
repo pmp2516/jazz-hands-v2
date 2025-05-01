@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM nixos/nix AS builder
 
-COPY . /src
+COPY flake.* /src/
 WORKDIR /src
 
 RUN nix \
@@ -17,7 +17,8 @@ WORKDIR /app
 
 COPY --from=builder /tmp/store-closure /nix/store
 COPY --from=builder /src/result /app/result
-COPY --from=builder /src/static /app/static
+
+COPY ./static /app/static
 
 ENTRYPOINT [ "/app/result/bin/static-web-server", "--root", "/app/static" ]
 
