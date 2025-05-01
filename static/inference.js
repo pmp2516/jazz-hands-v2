@@ -1,23 +1,16 @@
 // import * as tf from '@tensorflow/tfjs';
 
-/**
- * Mix-in to make a layer “plastic”: captures last inputs/outputs
- * and provides .kernel for weight updates.
- */
-function makePlastic(layer, {eta=1e-3, alpha=1e-4, gamma=1e-2, eps=1e-6} = {}) {
-  // Only apply to layers with a .kernel variable (Dense, Conv*)
-  if (!layer.kernel) return layer;
+let saving = false;
+const SAVE_INTERVAL_MS = 60 * 1000; // save at most once per minute
+let lastSave = 0;
 
-  // Wrap apply() to capture x and y
+function makePlastic(layer, { eta = 1e-3, alpha = 1e-4, gamma = 1e-2, eps = 1e-6 } = {}) {
+  if (!layer.kernel) return layer;
   const origApply = layer.apply.bind(layer);
   layer.lastX = null;
   layer.lastY = null;
   layer.prevY = null;
-  layer.eta = eta;
-  layer.alpha = alpha;
-  layer.gamma = gamma;
-  layer.eps = eps;
-
+  layer.eta = eta; layer.alpha = alpha; layer.gamma = gamma; layer.eps = eps;
   layer.apply = function(x) {
     const y = origApply(x);
     layer.lastX = x;
@@ -27,90 +20,122 @@ function makePlastic(layer, {eta=1e-3, alpha=1e-4, gamma=1e-2, eps=1e-6} = {}) {
   return layer;
 }
 
-/**
- * Creates and initializes the runner. Call .step() repeatedly.
- * @param {string} modelUrl – URL to your TF.js model.json
- */
-export async function createGestureMidiRunner(modelUrl) {
-  // 1) Load model
-  const model = await tf.loadLayersModel(modelUrl);
+function plasticUpdate(layer) {
+  if (!layer.kernel || !layer.lastX || !layer.lastY) return;
+  const yPrev = layer.prevY || layer.lastY.clone();
+  const yCurr = layer.lastY;
+  const e = yCurr.sub(yPrev);
 
-  // 2) Make all layers plastic
+  const xFlat = layer.lastX.flatten();
+  const eFlat = e.flatten();
+  const outer = tf.outerProduct(eFlat, xFlat).mul(layer.eta);
+
+  const Y = yPrev.flatten().expandDims(1);
+  const cov = Y.matMul(Y.transpose())
+    .div(Y.shape[0])
+    .add(tf.eye(Y.shape[0]).mul(layer.eps));
+  const varGrad = tf.linalg.inv(cov).mul(layer.gamma);
+
+  const W = layer.kernel.read();
+  const dW = outer.add(varGrad).sub(W.mul(layer.alpha));
+  layer.kernel.assign(W.add(dW));
+
+  layer.prevY?.dispose();
+  layer.prevY = yCurr.clone();
+}
+
+/**
+ * Create (or restore) the model + runner.
+ * Returns an object with .step(audioTensor, videoTensor) method.
+ */
+export async function createGestureMidiRunner(config) {
+  let model;
+  try {
+    // 1) Try to load from IndexedDB
+    model = await tf.loadLayersModel('indexeddb://gesture-midi');
+    console.log('Loaded model from IndexedDB.');
+  } catch (e) {
+    console.warn('No model in IndexedDB, building fresh one.');
+    // 2) Dynamically import modeling.js and build fresh
+    const { buildGestureToMIDI } = await import('./modeling.js');
+    model = buildGestureToMIDI(config);
+
+    // Dummy forward to initialize weights
+    const audioDummy = tf.zeros([1, 1, 1]);
+    const videoDummy = tf.zeros([1, 1, 1, 1, 3]);
+    const audioStateDummy = tf.zeros([1, config.nAudioHeads, config.latentDim, config.latentDim]);
+    const videoStateDummy = tf.zeros([1, config.nVideoHeads, config.latentDim, config.latentDim]);
+    model.predict([audioDummy, videoDummy, audioStateDummy, videoStateDummy]);
+
+    // 3) Save fresh model to IndexedDB
+    await model.save('indexeddb://gesture-midi');
+    console.log('Saved fresh model to IndexedDB.');
+  }
+
+  // 4) Wrap plastic layers
   function traverseLayers(layer, fn) {
     fn(layer);
-    // TF.js uses .layers for Sequential/Functional; custom Layers may expose _layers or subLayers
     const children = layer.layers || layer._layers || [];
     children.forEach(child => traverseLayers(child, fn));
   }
 
-  // Then:
   traverseLayers(model, makePlastic);
 
-  // 3) Initialize recurrent states to zeros (batch=1)
-  const config = {
-    nAudioHeads: model.inputs[2].shape[1],
-    nVideoHeads: model.inputs[3].shape[1],
-    latentDim: model.outputs[0].shape[1],
-  };
+  // 5) Initialize recurrent states
   let audioState = tf.zeros([1, config.nAudioHeads, config.latentDim, config.latentDim]);
   let videoState = tf.zeros([1, config.nVideoHeads, config.latentDim, config.latentDim]);
 
-  /**
-   * Process one frame: audioFrame [T,1], videoFrame [D,H,W,3]
-   * Returns { noteLogits: tf.Tensor1D, veloLogits: tf.Tensor1D }
-   */
+  const crossModalLayer = model.getLayer('cross_modal');
+
+  /** Performs one inference + plasticity step, returns logits */
   async function step(audioFrame, videoFrame) {
     return tf.tidy(() => {
-      // Ensure batch dim = 1
       const aIn = audioFrame.expandDims(0);
       const vIn = videoFrame.expandDims(0);
 
-      // 1) Inference
-      const [noteLogits, veloLogits, newAudioState, newVideoState] =
+      const [noteLogits, veloLogits, newAudioState, newVideoState,] =
         model.predict([aIn, vIn, audioState, videoState]);
 
-      // 2) Plasticity: update every plastic layer
-      model.layers.forEach(layer => {
-        if (!layer.kernel || !layer.lastX || !layer.lastY) return;
+      // Plasticity updates
+      traverseLayers(model, plasticUpdate);
 
-        // Two-step prediction error
-        const yPrev = layer.prevY || layer.lastY.clone();
-        const yCurr = layer.lastY;
-        const e = yCurr.sub(yPrev);
+      // At time t, you have audioLatent_t  and  videoLatent_t
+      // At t+1, you have audioLatent_{t+1} and videoLatent_{t+1}
 
-        // Hebbian outer product: e ⊗ x
-        const xFlat = layer.lastX.flatten();
-        const eFlat = e.flatten();
-        const outer = tf.outerProduct(eFlat, xFlat).mul(layer.eta);
+      // Prediction error between modalities:
+      const e_latent = videoLatent_t1.sub(audioLatent_t1);
 
-        // Variance-maximization term: inv(cov + eps I)
-        const Y = yPrev.flatten().expandDims(1);       // [D,1]
-        const cov = Y.matMul(Y.transpose())
-                     .div(Y.shape[0])
-                     .add(tf.eye(Y.shape[0]).mul(layer.eps));
-        const varGrad = tf.linalg.inv(cov).mul(layer.gamma);
+      // Hebbian update on your cross-modal projection W_cp:
+      // pre-synaptic = audioLatent_t1, post-synaptic = videoLatent_t1
+      const ΔW_cp = tf.outerProduct(e_latent.flatten(), audioLatent_t1.flatten()).mul(η)
+        .sub(W_cp.mul(α));
+      // (plus any variance regularizer if you keep it)
+      W_cp.assign(W_cp.add(ΔW_cp));
 
-        // Total weight update ΔW
-        const W = layer.kernel.read();
-        const dW = outer.add(varGrad).sub(W.mul(layer.alpha));
 
-        // Apply update
-        layer.kernel.assign(W.add(dW));
-
-        // Save for next step
-        layer.prevY?.dispose();
-        layer.prevY = yCurr.clone();
-      });
-
-      // 3) Update recurrent state
+      // Update states
       audioState.dispose();
       videoState.dispose();
       audioState = newAudioState;
       videoState = newVideoState;
 
+      // Periodic save
+      // FIXME Race condition on `saving`
+      const now = Date.now();
+      if (now - lastSave > SAVE_INTERVAL_MS && !saving) {
+        saving = true;
+        model.save('indexeddb://gesture-midi')
+          .then(() => {
+            console.log('Model auto-saved to IndexedDB.');
+            lastSave = now;
+          })
+          .catch(err => console.error('Save failed:', err))
+          .finally(() => { saving = false; });
+      }
+
       return {
-        noteLogits: noteLogits.squeeze(),   // shape [notes]
-        veloLogits: veloLogits.squeeze()    // shape [velocities]
+        noteLogits: noteLogits.squeeze(),
+        veloLogits: veloLogits.squeeze()
       };
     });
   }

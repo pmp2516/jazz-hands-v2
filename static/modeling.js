@@ -20,8 +20,8 @@ class RNNBlock extends tf.layers.Layer {
     this.downW = this.addWeight('downW', [dModel, dModel], 'float32', tf.initializers.glorotNormal());
 
     // Layer norms
-    this.ln1 = tf.layers.layerNormalization({axis: -1});
-    this.ln2 = tf.layers.layerNormalization({axis: -1});
+    this.ln1 = tf.layers.layerNormalization({ axis: -1 });
+    this.ln2 = tf.layers.layerNormalization({ axis: -1 });
 
     // Initialize recurrent state buffer
     this.state = tf.variable(tf.zeros([nHeads, this.headDim, this.headDim]));
@@ -67,7 +67,7 @@ class RNNBlock extends tf.layers.Layer {
   }
 
   getConfig() {
-    return {dModel: this.dModel, nHeads: this.nHeads};
+    return { dModel: this.dModel, nHeads: this.nHeads };
   }
 }
 tf.serialization.registerClass(RNNBlock);
@@ -76,8 +76,8 @@ export function buildGestureToMIDI(config) {
   // 1) Inputs with dynamic spatial/temporal dims:
   //    - audio: [timeSteps, 1] → any length time-series, single channel
   //    - video: [depth, height, width, 3] → any depth/size RGB volume
-  const audioIn = tf.input({shape: [null, 1], name: 'audio_input'});
-  const videoIn = tf.input({shape: [null, null, null, 3], name: 'video_input'});
+  const audioIn = tf.input({ shape: [null, 1], name: 'audio_input' });
+  const videoIn = tf.input({ shape: [null, null, null, 3], name: 'video_input' });
 
   // 2) Recurrent state inputs remain fixed by heads × latentDim²
   const audioStateIn = tf.input({
@@ -92,8 +92,8 @@ export function buildGestureToMIDI(config) {
   // 3) Video encoder – conv3d with dynamic dims, then global mean‐pool
   let v = tf.layers.conv3d({
     filters: config.videoChannels,
-    kernelSize: [3,5,5],
-    strides: [1,2,2],
+    kernelSize: [3, 5, 5],
+    strides: [1, 2, 2],
     padding: 'same'
   }).apply(videoIn);
   v = tf.relu(v);
@@ -104,8 +104,8 @@ export function buildGestureToMIDI(config) {
   }).apply(v);
   v = tf.relu(v);
   // mean over depth, height, width
-  v = tf.mean(v, [1,2,3]);
-  v = tf.layers.dense({units: config.latentDim}).apply(v);
+  v = tf.mean(v, [1, 2, 3]);
+  v = tf.layers.dense({ units: config.latentDim, name: 'cross_modal' }).apply(v);
 
   // 4) Video recurrent core
   const [videoLatent, videoState] = new RNNBlock(
@@ -127,7 +127,7 @@ export function buildGestureToMIDI(config) {
   a = tf.relu(a);
   // mean over time
   a = tf.mean(a, [1]);
-  a = tf.layers.dense({units: config.latentDim}).apply(a);
+  a = tf.layers.dense({ units: config.latentDim }).apply(a);
 
   // 6) Audio recurrent core
   const [audioLatent, audioState] = new RNNBlock(
@@ -140,14 +140,14 @@ export function buildGestureToMIDI(config) {
   const latent = videoLatent; // tf.add(videoLatent, hop);
 
   // 8) Output heads
-  const noteLogits = tf.layers.dense({units: config.notes.length})
-                         .apply(latent);
-  const veloLogits = tf.layers.dense({units: config.velocities.length})
-                         .apply(latent);
+  const noteLogits = tf.layers.dense({ units: config.notes.length })
+    .apply(latent);
+  const veloLogits = tf.layers.dense({ units: config.velocities.length })
+    .apply(latent);
 
   return tf.model({
-    inputs: [ audioIn, videoIn, audioStateIn, videoStateIn ],
-    outputs: [ noteLogits, veloLogits, audioState, videoState ]
+    inputs: [audioIn, videoIn, audioStateIn, videoStateIn],
+    outputs: [noteLogits, veloLogits, audioState, videoState, audioLatent, videoLatent]
   });
 }
 
