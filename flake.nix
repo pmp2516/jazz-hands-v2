@@ -12,6 +12,10 @@
         pkgs = import nixpkgs { inherit system; };
         siteDir = ./static;
         sws = pkgs.static-web-server;
+        appClosure = pkgs.buildEnv {
+          name = "jazz-hands-closure";
+          paths = [ sws siteDir ];
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -31,6 +35,8 @@
             ExposedPorts = { "80/tcp" = {}; };
           };
         };
+
+        packages.appClosure = appClosure;
 
         apps.default = flake-utils.lib.mkApp {
           drv = pkgs.writeShellApplication {
