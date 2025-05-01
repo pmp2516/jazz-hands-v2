@@ -1,20 +1,70 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <title>Gesture→MIDI Demo</title>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.5/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-k6d4wzSIapyDyv1kpU366/PK5hCdSbCRGRCMv+eplOQJWyd1fbcAu9OCUj5zNLiq"
+    crossorigin="anonymous"></script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.5/dist/css/bootstrap.min.css" rel="stylesheet"
+    integrity="sha384-SgOJa3DmI69IUzQ2PVdRZhwQ+dy64/BUtbMJw1MZ8t5HZApcHrRKUc4W0kG879m7" crossorigin="anonymous">
   <style>
-    body { display: flex; flex-direction: column; align-items: center; }
-    video, canvas { border: 1px solid #ccc; margin: 8px; }
+    body {
+      margin: 20px;
+    }
+
+    #video,
+    #vcanvas {
+      border: 1px solid #ccc;
+      margin: 8px;
+    }
+
+    #vcanvas {
+      display: none;
+    }
   </style>
 </head>
+
 <body>
-  <h1>Gesture→MIDI Live Demo</h1>
-  <video id="video" autoplay playsinline width="320" height="240"></video>
-  <canvas id="vcanvas" width="224" height="224" style="display:none;"></canvas>
+  <div class="container">
+    <h1>Gesture→MIDI Live Demo</h1>
+    <button type="button" class="btn btn-primary mb-4" data-toggle="modal" data-target="#settingsModal">
+      Settings
+    </button>
+    <video id="video" class="w-100 mb-4" autoplay playsinline></video>
+  </div>
+
+  <div class="modal fade" id="settingsModal" tabindex="-1" role="dialog" aria-labelledby="settingsModalLabel"
+    aria-hidden="true">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="settingsModalLabel">Settings</h5>
+          <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <!-- MIDI Output selection -->
+          <div class="form-group">
+            <label for="midiSelect">MIDI Output:</label>
+            <select id="midiSelect" class="form-control">
+              <option value="builtin">Built-in Synthesizer</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+          <button type="button" class="btn btn-primary" id="saveSettings">Save Settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <canvas id="vcanvas"></canvas>
   <script type="module">
-    import { createGestureMidiRunner } from '/inference.js';
+    import {createGestureMidiRunner} from '/inference.js';
 
     // Stub: replace with real MIDI‐output logic
     function consumeMIDI(note, velocity) {
@@ -24,10 +74,10 @@
 
     (async () => {
       // 1) Set up media streams
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
       const videoEl = document.getElementById('video');
       videoEl.srcObject = stream;
-      
+
       // 2) Create audio context & ScriptProcessor for PCM frames
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const mic = audioCtx.createMediaStreamSource(stream);
@@ -35,7 +85,7 @@
       const processor = audioCtx.createScriptProcessor(1024, 1, 1);
       mic.connect(processor);
       processor.connect(audioCtx.destination);
-      
+
       // 3) Prepare offscreen canvas for video frame resizing
       const vcanvas = document.getElementById('vcanvas');
       const vctx = vcanvas.getContext('2d');
@@ -67,7 +117,7 @@
           });
 
           // --- Run inference + Hebbian update
-          const { noteLogits, veloLogits } = await runner.step(audioTensor, videoTensor);
+          const {noteLogits, veloLogits} = await runner.step(audioTensor, videoTensor);
 
           // --- Decode logits to argmax
           const note = noteLogits.argMax().arraySync();
@@ -88,4 +138,5 @@
     })();
   </script>
 </body>
+
 </html>
