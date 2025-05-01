@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gesture→MIDI Demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.0.0/dist/tf.min.js"></script>
+  <script type="module" src="/inference.js"></script>
+  <style>
+    body { display: flex; flex-direction: column; align-items: center; }
+    video, canvas { border: 1px solid #ccc; margin: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Gesture→MIDI Live Demo</h1>
+  <video id="video" autoplay playsinline width="320" height="240"></video>
+  <canvas id="vcanvas" width="224" height="224" style="display:none;"></canvas>
+  <script type="module">
+    import { createGestureMidiRunner } from 'inference';
+
+    // Stub: replace with real MIDI‐output logic
+    function consumeMIDI(note, velocity) {
+      console.log(`MIDI → note: ${note}, velocity: ${velocity}`);
+      // e.g. send to Web MIDI API or WebAudio synth
+    }
+
+    (async () => {
+      // 1) Set up media streams
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const videoEl = document.getElementById('video');
+      videoEl.srcObject = stream;
+      
+      // 2) Create audio context & ScriptProcessor for PCM frames
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const mic = audioCtx.createMediaStreamSource(stream);
+      //  bufferSize must be a power of 2: 1024 samples ≈ 23ms @ 44.1kHz
+      const processor = audioCtx.createScriptProcessor(1024, 1, 1);
+      mic.connect(processor);
+      processor.connect(audioCtx.destination);
+      
+      // 3) Prepare offscreen canvas for video frame resizing
+      const vcanvas = document.getElementById('vcanvas');
+      const vctx = vcanvas.getContext('2d');
+
+      // 4) Load the TF.js runner
+      const runner = await createGestureMidiRunner('/models/gesture_to_midi/model.json');
+
+      let latestAudioBuffer = null;
+      // On each audio process, capture PCM float32 data
+      processor.onaudioprocess = ev => {
+        const input = ev.inputBuffer.getChannelData(0);
+        // Copy into a Float32Array for TensorFlow.js
+        latestAudioBuffer = new Float32Array(input);
+      };
+
+      // 5) Main loop: grab latest audio & video, run inference + plasticity
+      async function frameLoop() {
+        if (latestAudioBuffer) {
+          // --- Prepare audio tensor: [timeSteps, 1]
+          const audioTensor = tf.tensor(latestAudioBuffer, [latestAudioBuffer.length, 1]);
+
+          // --- Prepare video tensor: capture & resize frame to 224×224
+          vctx.drawImage(videoEl, 0, 0, vcanvas.width, vcanvas.height);
+          const imgData = vctx.getImageData(0, 0, vcanvas.width, vcanvas.height);
+          // tf.browser.fromPixels returns [H,W,3], we need [D,H,W,3] with D=1
+          const videoTensor = tf.tidy(() => {
+            const px = tf.browser.fromPixels(imgData).toFloat().div(255);
+            return px.expandDims(0);  // shape [1,224,224,3]
+          });
+
+          // --- Run inference + Hebbian update
+          const { noteLogits, veloLogits } = await runner.step(audioTensor, videoTensor);
+
+          // --- Decode logits to argmax
+          const note = noteLogits.argMax().arraySync();
+          const velocity = veloLogits.argMax().arraySync();
+          consumeMIDI(note, velocity);
+
+          // Clean up
+          audioTensor.dispose();
+          videoTensor.dispose();
+          noteLogits.dispose();
+          veloLogits.dispose();
+        }
+        requestAnimationFrame(frameLoop);
+      }
+
+      // Start!
+      frameLoop();
+    })();
+  </script>
+</body>
+</html>
