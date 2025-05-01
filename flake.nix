@@ -23,18 +23,18 @@
         };
 
         packages.default = pkgs.dockerTools.buildImage {
-          name = "static-web-server-site";
+          name = "jazz-hands-static";
           tag = "latest";
-          contents = [ sws siteDir ];
+          copyToRoot = [ sws siteDir ];
           config = {
-            Cmd = [ "${sws}/bin/static-web-server" "--root" "${siteDir}" ];
+            Entrypoint = [ "${sws}/bin/static-web-server" "--root" "${siteDir}" ];
             ExposedPorts = { "80/tcp" = {}; };
           };
         };
 
         apps.default = flake-utils.lib.mkApp {
           drv = pkgs.writeShellApplication {
-            name = "serve-static";
+            name = "serve-jazz-hands-static";
             text = ''
               exec ${sws}/bin/static-web-server --root ${siteDir}
             '';
