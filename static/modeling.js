@@ -1,6 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
 
-// Recurrent predictive‐Hebbian block, two‐step error updates done in your training loop.
 class RNNBlock extends tf.layers.Layer {
   constructor(dModel, nHeads, kwargs) {
     super(kwargs);
@@ -44,9 +43,9 @@ class RNNBlock extends tf.layers.Layer {
     const vh = tf.reshape(v, [batchSize, this.nHeads, this.headDim]);
 
     // 3) WKV‐style recurrent update
-    // decay: state ← state + γ
+    // decay: state ← state * γ
     const γ = this.gamma.read().reshape([1, this.nHeads, this.headDim, 1]);
-    let state = prevState.add(γ);
+    let state = prevState.mul(γ);
     // outer(k, v): [batch, heads, headDim, 1] × [batch, heads, 1, headDim]
     const k_h = kh.reshape([batchSize, this.nHeads, this.headDim, 1]);
     const v_h = vh.reshape([batchSize, this.nHeads, 1, this.headDim]);
@@ -104,7 +103,7 @@ export function buildGestureToMIDI(config) {
     padding: 'same'
   }).apply(v);
   v = tf.relu(v);
-  // AdaptiveAvgPool3d ⇒ mean over depth, height, width
+  // mean over depth, height, width
   v = tf.mean(v, [1,2,3]);
   v = tf.layers.dense({units: config.latentDim}).apply(v);
 
@@ -126,7 +125,7 @@ export function buildGestureToMIDI(config) {
     padding: 'same'
   }).apply(a);
   a = tf.relu(a);
-  // AdaptiveAvgPool1d ⇒ mean over time
+  // mean over time
   a = tf.mean(a, [1]);
   a = tf.layers.dense({units: config.latentDim}).apply(a);
 
@@ -135,10 +134,10 @@ export function buildGestureToMIDI(config) {
     config.latentDim, config.nAudioHeads
   ).apply([a, audioStateIn]);
 
-  // 7) Cross‐modal fusion with Hopfield (implement your JS version here)
-  const hop = /* yourHopfieldJS(videoLatent) */ videoLatent;
+  // 7) Cross‐modal fusion with Hopfield TODO
+  // const hop = hopfield(videoLatent);
 
-  const latent = tf.add(videoLatent, hop);
+  const latent = videoLatent; // tf.add(videoLatent, hop);
 
   // 8) Output heads
   const noteLogits = tf.layers.dense({units: config.notes.length})
