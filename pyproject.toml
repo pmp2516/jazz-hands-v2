@@ -6,9 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "flask>=3.1.0",
-    "hopfield-layers",
-    "torch>=2.7.0",
+    "setuptools>=80.1.0",
+    "wheel>=0.45.1",
 ]
-
-[tool.uv.sources]
-hopfield-layers = { git = "https://github.com/ml-jku/hopfield-layers" }

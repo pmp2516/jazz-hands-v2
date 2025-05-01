@@ -3,8 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>Gesture→MIDI Demo</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.0.0/dist/tf.min.js"></script>
-  <script type="module" src="/inference.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
   <style>
     body { display: flex; flex-direction: column; align-items: center; }
     video, canvas { border: 1px solid #ccc; margin: 8px; }
@@ -15,7 +14,7 @@
   <video id="video" autoplay playsinline width="320" height="240"></video>
   <canvas id="vcanvas" width="224" height="224" style="display:none;"></canvas>
   <script type="module">
-    import { createGestureMidiRunner } from 'inference';
+    import { createGestureMidiRunner } from '/inference.js';
 
     // Stub: replace with real MIDI‐output logic
     function consumeMIDI(note, velocity) {
