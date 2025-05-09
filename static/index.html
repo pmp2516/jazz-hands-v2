@@ -4,10 +4,13 @@
 <head>
   <meta charset="UTF-8" />
   <title>Jazz Hands</title>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+  <script src="https://code.jquery.com/jquery-3.7.1.slim.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.5/dist/css/bootstrap.min.css" rel="stylesheet"
     integrity="sha384-SgOJa3DmI69IUzQ2PVdRZhwQ+dy64/BUtbMJw1MZ8t5HZApcHrRKUc4W0kG879m7" crossorigin="anonymous">
-  <script src="http://unpkg.com/tone"></script>
+  <script src="https://unpkg.com/meyda@5.6.3/dist/web/meyda.min.js"></script>
+  <script src="https://unpkg.com/tone@14.7.39"></script>
+  <script type="module" src="frontend.js"></script>
   <style>
     body {
       margin: 20px;
@@ -61,146 +64,6 @@
     </div>
   </div>
   <canvas id="vcanvas"></canvas>
-  <script type="module">
-    import {createGestureMidiRunner} from '/inference.js';
-
-    let midiAccess, currentOutput = null;
-    const midiSelect = document.getElementById('midiSelect');
-    let synth = new Tone.Synth().toDestination();
-
-    // Populate outputs (including Built-in)
-    async function initMIDI() {
-      try {
-        midiAccess = await navigator.requestMIDIAccess();
-        midiAccess.addEventListener('statechange', () => populateMIDIDevices());
-        populateMIDIDevices();
-      } catch (err) {
-        console.warn('MIDI not available:', err);
-      }
-    }
-
-    function populateMIDIDevices() {
-      // Clear old options
-      midiSelect.innerHTML = '<option value="builtin">Built-in Synthesizer</option>';
-      // Add each hardware output
-      if (midiAccess) {
-        for (let output of midiAccess.outputs.values()) {
-          const opt = document.createElement('option');
-          opt.value = output.id;
-          opt.text = output.name;
-          midiSelect.appendChild(opt);
-        }
-      }
-    }
-
-    // On change, record selection
-    midiSelect.addEventListener('change', () => {
-      const sel = midiSelect.value;
-      if (sel === 'builtin') {
-        currentOutput = 'builtin';
-      } else {
-        currentOutput = midiAccess.outputs.get(sel);
-      }
-    });
-
-    document.getElementById('saveSettings').addEventListener('click', () => {
-      bootstrap.Modal.getInstance(settingsModalEl).hide();
-      if (currentOutput && currentOutput === 'builtin') {
-        synth = new Tone.Synth().toDestination();
-      }
-      else {
-        synth = null;
-      }
-    });
-
-    // Stub: replace with real MIDI‐output logic
-    function consumeMIDI(note, velocity) {
-      console.log(`MIDI → note: ${note}, velocity: ${velocity}`);
-      if (currentOutput === 'builtin') {
-        if (!synth) {
-          console.warn("Synth is missing, but output is 'builtin!'");
-        }
-        synth.triggerAttackRelease(Tone.Frequency(note, 'midi'), '8n', undefined, velocity / 127);
-      }
-      else {
-        currentOutput.send([0x90, note, velocity]); // 0x90 is "note_on"
-      }
-    }
-
-    (async () => {
-      // 1) Set up media streams
-      const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-      await initMIDI();
-      const videoEl = document.getElementById('video');
-      videoEl.srcObject = stream;
-
-      // 2) Create audio context & ScriptProcessor for PCM frames
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const mic = audioCtx.createMediaStreamSource(stream);
-      //  bufferSize must be a power of 2: 1024 samples ≈ 23ms @ 44.1kHz
-      const processor = audioCtx.createScriptProcessor(1024, 1, 1);
-      mic.connect(processor);
-      processor.connect(audioCtx.destination);
-
-      // 3) Prepare offscreen canvas for video frame resizing
-      const vcanvas = document.getElementById('vcanvas');
-      const vctx = vcanvas.getContext('2d');
-
-      // 4) Load the TF.js runner
-      const runner = await createGestureMidiRunner({
-        audioChannels: 5,
-        videoChannels: 5,
-        nAudioHeads: 8,
-        nVideoHeads: 8,
-        latentDim: 64,
-        notes: [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71],
-        velocities: [0, 30, 60, 90, 120]
-      });
-
-      let latestAudioBuffer = null;
-      // On each audio process, capture PCM float32 data
-      processor.onaudioprocess = ev => {
-        const input = ev.inputBuffer.getChannelData(0);
-        // Copy into a Float32Array for TensorFlow.js
-        latestAudioBuffer = new Float32Array(input);
-      };
-
-      // 5) Main loop: grab latest audio & video, run inference + plasticity
-      async function frameLoop() {
-        if (latestAudioBuffer) {
-          // --- Prepare audio tensor: [timeSteps, 1]
-          const audioTensor = tf.tensor(latestAudioBuffer, [latestAudioBuffer.length, 1]);
-
-          // --- Prepare video tensor: capture & resize frame to 224×224
-          vctx.drawImage(videoEl, 0, 0, vcanvas.width, vcanvas.height);
-          const imgData = vctx.getImageData(0, 0, vcanvas.width, vcanvas.height);
-          // tf.browser.fromPixels returns [H,W,3], we need [D,H,W,3] with D=1
-          const videoTensor = tf.tidy(() => {
-            const px = tf.browser.fromPixels(imgData).toFloat().div(255);
-            return px.expandDims(0);  // shape [1,224,224,3]
-          });
-
-          // --- Run inference + Hebbian update
-          const {noteLogits, veloLogits} = await runner.step(audioTensor, videoTensor);
-
-          // --- Decode logits to argmax
-          const note = noteLogits.argMax().arraySync();
-          const velocity = veloLogits.argMax().arraySync();
-          consumeMIDI(note, velocity);
-
-          // Clean up
-          audioTensor.dispose();
-          videoTensor.dispose();
-          noteLogits.dispose();
-          veloLogits.dispose();
-        }
-        requestAnimationFrame(frameLoop);
-      }
-
-      // Start!
-      frameLoop();
-    })();
-  </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.5/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-k6d4wzSIapyDyv1kpU366/PK5hCdSbCRGRCMv+eplOQJWyd1fbcAu9OCUj5zNLiq"
     crossorigin="anonymous"></script>

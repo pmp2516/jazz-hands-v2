@@ -1,4 +1,5 @@
 // import * as tf from '@tensorflow/tfjs';
+import { SpatialTransformer } from './stn';
 
 class ModernHopfieldLayer extends tf.layers.Layer {
   constructor(config) {
@@ -114,158 +115,321 @@ class MeanLayer extends tf.layers.Layer {
 }
 tf.serialization.registerClass(MeanLayer);
 
-class RNNBlock extends tf.layers.Layer {
+/**
+ * Helper delegation for Hebbian updates.
+ * Determines update logic based on layer type.
+ */
+function hebbianUpdate(param, preAct, postAct, sleeping, type) {
+  const lr = sleeping ? 1e-4 : 1e-3;
+  let delta;
+  switch (type) {
+    case 'dense':
+      delta = tf.matMul(preAct.transpose(), postAct).div(tf.scalar(preAct.shape[0]));
+      break;
+    case 'conv1d':
+      const in1 = preAct.reshape([-1, preAct.shape[2]]);
+      delta = tf.matMul(in1.transpose(), postAct).div(tf.scalar(in1.shape[0]));
+      break;
+    case 'conv2d':
+      const in2 = preAct.reshape([preAct.shape[0], -1]);
+      delta = tf.matMul(in2.transpose(), postAct).div(tf.scalar(preAct.shape[0]));
+      break;
+    case 'rnnBlock':
+      const inR = preAct.reshape([-1, preAct.shape[2]]);
+      const postR = postAct.reshape([-1, postAct.shape[1]]);
+      delta = tf.matMul(inR.transpose(), postR).div(tf.scalar(inR.shape[0]));
+      break;
+    case 'stn':
+      const inS = preAct.reshape([preAct.shape[0], -1]);
+      delta = tf.matMul(inS.transpose(), postAct).div(tf.scalar(inS.shape[0]));
+      break;
+    default:
+      throw new Error(`Unsupported Hebbian type: ${type}`);
+  }
+  const W = param.read();
+  param.write(W.add(delta.mul(tf.scalar(lr))));
+}
+
+export class RNNBlock extends tf.layers.Layer {
   constructor(dModel, nHeads, kwargs) {
     super(kwargs);
     this.dModel = dModel;
     this.nHeads = nHeads;
     this.headDim = dModel / nHeads;
-
-    // Projections: q, k, v
     this.qProj = this.addWeight('qProj', [dModel, dModel], 'float32', tf.initializers.glorotNormal());
     this.kProj = this.addWeight('kProj', [dModel, dModel], 'float32', tf.initializers.glorotNormal());
     this.vProj = this.addWeight('vProj', [dModel, dModel], 'float32', tf.initializers.glorotNormal());
-
-    // Learnable decay γ per head
     this.gamma = this.addWeight('gamma', [nHeads, this.headDim], 'float32', tf.initializers.ones());
-
-    // Gated MLP
-    this.gateW = this.addWeight('gateW', [dModel, 2 * dModel], 'float32', tf.initializers.glorotNormal());
+    this.gateW = this.addWeight('gateW', [dModel, 2*dModel], 'float32', tf.initializers.glorotNormal());
     this.downW = this.addWeight('downW', [dModel, dModel], 'float32', tf.initializers.glorotNormal());
-
-    // Layer norms
-    this.ln1 = tf.layers.layerNormalization({ axis: -1 });
-    this.ln2 = tf.layers.layerNormalization({ axis: -1 });
-
-    // Initialize recurrent state buffer
-    this.state = tf.variable(tf.zeros([1, nHeads, this.headDim, this.headDim]));
+    this.ln1 = tf.layers.layerNormalization({axis:-1});
+    this.ln2 = tf.layers.layerNormalization({axis:-1});
+    this.initialState = tf.zeros([this.nHeads, this.headDim, this.headDim]);
   }
 
-  build(inputShape) { super.build(inputShape); }
-
-  call([x, prevState]) {
-    // 1) Norm + linear projections
-    const xNorm = this.ln1.apply(x);
+  step(x_t, prevState, sleeping=false) {
+    // Hebbian update for input x_t and previous state before computing new
+    hebbianUpdate(
+      this.qProj,
+      x_t,
+      prevState.mean(-1),
+      sleeping,
+      'rnnBlock'
+    );
+    const xNorm = this.ln1.apply(x_t);
     const q = xNorm.dot(this.qProj.read());
     const k = xNorm.dot(this.kProj.read());
     const v = xNorm.dot(this.vProj.read());
 
-    // 2) Split into heads
-    const batchSize = x.shape[0];
-    const qh = tf.reshape(q, [batchSize, this.nHeads, this.headDim]);
-    const kh = tf.reshape(k, [batchSize, this.nHeads, this.headDim]);
-    const vh = tf.reshape(v, [batchSize, this.nHeads, this.headDim]);
+    // Hebbian updates for kProj, vProj
+    hebbianUpdate(
+      this.kProj,
+      x_t,
+      prevState.mean(-1),
+      sleeping,
+      'rnnBlock'
+    );
+    hebbianUpdate(
+      this.vProj,
+      x_t,
+      prevState.mean(-1),
+      sleeping,
+      'rnnBlock'
+    );
 
-    // 3) WKV‐style recurrent update
-    // decay: state ← state * γ
+    const [batch] = x_t.shape;
+    const qh = q.reshape([batch, this.nHeads, this.headDim]);
+    const kh = k.reshape([batch, this.nHeads, this.headDim]);
+    const vh = v.reshape([batch, this.nHeads, this.headDim]);
     const γ = this.gamma.read().reshape([1, this.nHeads, this.headDim, 1]);
-    let state = prevState.reshape([1, this.nHeads, this.headDim, this.headDim]);
-    state = state.mul(γ);
-    // outer(k, v): [batch, heads, headDim, 1] × [batch, heads, 1, headDim]
-    const k_h = kh.reshape([batchSize, this.nHeads, this.headDim, 1]);
-    const v_h = vh.reshape([batchSize, this.nHeads, 1, this.headDim]);
-    state = state.add(k_h.mul(v_h));
+    let state = prevState.mul(γ);
+    state = state.add(
+      tf.einsum(
+        'bhid,bhjd->bhij',
+        kh.reshape([batch, this.nHeads, this.headDim, 1]),
+        vh.reshape([batch, this.nHeads, 1, this.headDim])
+      )
+    );
 
-    // attention‐like output: o = (state ⋅ q) over last dim
-    const q_h = qh.reshape([batchSize, this.nHeads, this.headDim, 1]);
-    const o = state.matMul(q_h).reshape([batchSize, this.nHeads, this.headDim]);
-    const attnOut = o.reshape([batchSize, this.dModel]);
+    // Hebbian update for gamma
+    hebbianUpdate(
+      this.gamma,
+      x_t,
+      state.mean([1,3]),
+      sleeping,
+      'dense'
+    );
 
-    // 4) Gated MLP + residual
-    const x2 = this.ln2.apply(x.add(attnOut));
+    const o = state.matMul(
+      qh.reshape([batch, this.nHeads, this.headDim, 1])
+    ).reshape([batch, this.dModel]);
+    const x2 = this.ln2.apply(x_t.add(o));
     const gateMlpin = x2.dot(this.gateW.read());
     const [gate, mlpIn] = tf.split(gateMlpin, 2, -1);
-    const mlpOut = tf.mul(mlpIn * tf.sigmoid(mlpIn), tf.sigmoid(gate)).dot(this.downW.read());
 
-    const out = tf.addN([x, attnOut, mlpOut]);
+    // Hebbian update for gateW and downW
+    hebbianUpdate(
+      this.gateW,
+      x_t,
+      gate,
+      sleeping,
+      'rnnBlock'
+    );
+    hebbianUpdate(
+      this.downW,
+      mlpIn,
+      mlpIn,
+      sleeping,
+      'dense'
+    );
+
+    const mlpOut = tf.mul(
+      tf.silu(mlpIn),
+      tf.sigmoid(gate)
+    ).dot(this.downW.read());
+    const out = tf.addN([x_t, o, mlpOut]);
     return [out, state];
+  }
+
+  applySequence(x_seq, initState=null, sleeping=false) {
+    const [batch, time] = x_seq.shape;
+    let state = initState ||
+      tf.tile(this.initialState.expandDims(0), [batch,1,1,1]);
+    const outputs = [];
+    for (let t = 0; t < time; t++) {
+      const x_t = x_seq
+        .slice([0, t, 0], [batch, 1, this.dModel])
+        .squeeze([1]);
+      const [y, st] = this.step(x_t, state, sleeping);
+      outputs.push(y.expandDims(1));
+      state = st;
+    }
+    return [tf.concat(outputs, 1), state];
   }
 
   getConfig() {
     return { dModel: this.dModel, nHeads: this.nHeads };
   }
-
-  static get className() {
-    return 'RNNBlock';
-  }
 }
+
 tf.serialization.registerClass(RNNBlock);
 
-export function buildGestureToMIDI(config) {
-  // 1) Inputs with dynamic spatial/temporal dims:
-  //    - audio: [timeSteps, 1] → any length time-series, single channel
-  //    - video: [depth, height, width, 3] → any depth/size RGB volume
-  const audioIn = tf.input({ shape: [null, 1], name: 'audio_input' });
-  const videoIn = tf.input({ shape: [null, null, null, 3], name: 'video_input' });
+export class WakeSleepModel {
+  constructor(config) {
+    this.latentDim = config.latentDim;
+    this.hopfield = new ModernHopfieldLayer({ dim: this.latentDim });
+    this.convAudio = tf.layers.conv1d({
+      filters: this.latentDim,
+      kernelSize: 3,
+      padding: 'same',
+      activation: 'relu'
+    });
+    this.poolAudio = tf.layers.maxPooling1d({ poolSize: 2 });
+    this.stn = new SpatialTransformer({ inputChannels: config.videoChannels });
+    this.convVideo2d = tf.layers.conv2d({
+      filters: 16,
+      kernelSize: [3, 3],
+      padding: 'same',
+      activation: 'relu'
+    });
+    this.poolVideo2d = tf.layers.maxPooling2d({ poolSize: [2, 2] });
+    this.flattenVideo = tf.layers.flatten();
+    this.projVideo = tf.layers.dense({ units: this.latentDim, activation: 'relu' });
+    this.rnnA = new RNNBlock(this.latentDim, config.nAudioHeads);
+    this.rnnV = new RNNBlock(this.latentDim, config.nVideoHeads);
+    this.pitchDecoder = tf.layers.dense({
+      units: config.notes.length,
+      activation: 'softmax'
+    });
+    this.volumeDecoder = tf.layers.dense({
+      units: config.velos.length,
+      activation: 'softmax'
+    });
+  }
 
-  // 2) Recurrent state inputs remain fixed by heads × latentDim²
-  const audioStateIn = tf.input({
-    shape: [config.nAudioHeads, config.latentDim],
-    name: 'audio_state'
-  });
-  const videoStateIn = tf.input({
-    shape: [config.nVideoHeads, config.latentDim],
-    name: 'video_state'
-  });
+  step(aSeq, vSeq, prevStates=[null,null], sleeping=false) {
+    return tf.tidy(() => {
+      let za = this.convAudio.apply(aSeq);
 
-  // 3) Video encoder – conv3d with dynamic dims, then global mean‐pool
-  let v = tf.layers.conv3d({
-    filters: config.videoChannels,
-    kernelSize: [3, 5, 5],
-    strides: [1, 2, 2],
-    padding: 'same'
-  }).apply(videoIn);
-  v = tf.layers.reLU().apply(v);
-  v = tf.layers.conv3d({
-    filters: config.videoChannels * 2,
-    kernelSize: 3,
-    padding: 'same'
-  }).apply(v);
-  v = tf.layers.reLU().apply(v);
-  // mean over depth, height, width
-  v = new MeanLayer([1,2,3]).apply(v);
-  v = tf.layers.dense({ units: config.latentDim, name: 'cross_modal' }).apply(v);
+      // Hebbian update immediately after convAudio
+      hebbianUpdate(
+        this.convAudio.trainableWeights.find(w => w.name.includes('kernel')),
+        aSeq.reshape([-1, aSeq.shape[2]]),
+        za.reshape([-1, za.shape[2]]),
+        sleeping,
+        'conv1d'
+      );
+      za = this.poolAudio.apply(za);
 
-  // 4) Video recurrent core
-  const [videoLatent, videoState] = new RNNBlock(
-    config.latentDim, config.nVideoHeads
-  ).apply([v, videoStateIn]);
+      const [b, t, h, w, c] = vSeq.shape;
+      const fv = vSeq.reshape([b * t, h, w, c]);
+      const stnOut = this.stn.apply(fv);
 
-  // 5) Audio encoder – conv1d with dynamic time length
-  let a = tf.layers.conv1d({
-    filters: config.audioChannels,
-    kernelSize: 5,
-    padding: 'same'
-  }).apply(audioIn);
-  a = tf.layers.reLU().apply(a);
-  a = tf.layers.conv1d({
-    filters: config.audioChannels * 2,
-    kernelSize: 3,
-    padding: 'same'
-  }).apply(a);
-  a = tf.layers.reLU().apply(a);
-  // mean over time
-  v = new MeanLayer([1]).apply(v);
-  a = tf.layers.dense({ units: config.latentDim }).apply(a);
+      // Hebbian update for STN
+      this.stn.trainableWeights.forEach(wVar =>
+        hebbianUpdate(
+          wVar,
+          fv.reshape([b * t, -1]),
+          stnOut.reshape([b * t, -1]),
+          sleeping,
+          'stn'
+        )
+      );
 
-  // 6) Audio recurrent core
-  const [audioLatent, audioState] = new RNNBlock(
-    config.latentDim, config.nAudioHeads
-  ).apply([a, audioStateIn]);
+      let zv = this.convVideo2d.apply(stnOut);
 
-  const recall = new ModernHopfieldLayer({ dim: config.latentDim }).apply(videoLatent);
+      // Hebbian update after convVideo2d
+      hebbianUpdate(
+        this.convVideo2d.trainableWeights.find(w => w.name.includes('kernel')),
+        stnOut.reshape([b * t, -1]),
+        zv.reshape([b * t, zv.shape[3]]),
+        sleeping,
+        'conv2d'
+      );
+      zv = this.poolVideo2d.apply(zv);
+      zv = this.flattenVideo.apply(zv);
+      zv = this.projVideo.apply(zv);
 
-  const latent = tf.layers.average().apply([videoLatent, recall]);
+      // Hebbian update after projVideo
+      hebbianUpdate(
+        this.projVideo.trainableWeights.find(w => w.name.includes('kernel')),
+        this.flattenVideo.apply(zv).reshape([b * t, this.latentDim]),
+        zv.reshape([b * t, this.latentDim]),
+        sleeping,
+        'dense'
+      );
+      zv = zv.reshape([b, t, this.latentDim]);
 
-  // 8) Output heads
-  const noteLogits = tf.layers.dense({ units: config.notes.length })
-    .apply(latent);
-  const veloLogits = tf.layers.dense({ units: config.velocities.length })
-    .apply(latent);
+      const [hA, sA] = this.rnnA.applySequence(za, prevStates[0], sleeping);
+      const [hB, sB] = this.rnnV.applySequence(zv, prevStates[1], sleeping);
+      const zA = hA.slice([0, hA.shape[1] - 1, 0], [b, 1, this.latentDim]).squeeze([1]);
+      const zB = hB.slice([0, hB.shape[1] - 1, 0], [b, 1, this.latentDim]).squeeze([1]);
+      const sim = tf.sum(zA.mul(zB), -1, true);
+      const errA = zB.sub(sim.mul(zA));
+      const errB = zA.sub(sim.mul(zB));
+      const zF = zA.add(zB).div(2);
+      const zR = this.hopfield.lookup(zF);
+      const zFin = zF.add(zR).div(2);
+      const seqLen = Math.max(hA.shape[1], hB.shape[1]);
+      const zSeq = zFin.expandDims(1).tile([1, seqLen, 1]);
 
-  return tf.model({
-    inputs: [audioIn, videoIn, audioStateIn, videoStateIn],
-    outputs: [noteLogits, veloLogits, audioState, videoState, audioLatent, videoLatent]
-  });
+      // Hebbian coupling updates for RNNBlocks using predictive errors
+      // Update RNN A using errA and audio latent zA
+      ['qProj','kProj','vProj','gateW','downW'].forEach(name => {
+        hebbianUpdate(
+          this.rnnA[name].read ? this.rnnA[name] : this.rnnA[name],
+          zA,
+          errA,
+          sleeping,
+          'rnnBlock'
+        );
+      });
+      // update gamma for RNN A
+      hebbianUpdate(
+        this.rnnA.gamma,
+        zA,
+        errA,
+        sleeping,
+        'dense'
+      );
+      // Update RNN B similarly
+      ['qProj','kProj','vProj','gateW','downW'].forEach(name => {
+        hebbianUpdate(
+          this.rnnV[name].read ? this.rnnV[name] : this.rnnV[name],
+          zB,
+          errB,
+          sleeping,
+          'rnnBlock'
+        );
+      });
+      hebbianUpdate(
+        this.rnnV.gamma,
+        zB,
+        errB,
+        sleeping,
+        'dense'
+      );
+      const pLogits = this.pitchDecoder.apply(zSeq);
+      const vLogits = this.volumeDecoder.apply(zSeq);
+
+      // Hebbian for decoders
+      hebbianUpdate(
+        this.pitchDecoder.trainableWeights.find(w => w.name.includes('kernel')),
+        zSeq.reshape([-1, this.latentDim]),
+        pLogits.reshape([-1, pLogits.shape[2]]),
+        sleeping,
+        'dense'
+      );
+      hebbianUpdate(
+        this.volumeDecoder.trainableWeights.find(w => w.name.includes('kernel')),
+        zSeq.reshape([-1, this.latentDim]),
+        vLogits.reshape([-1, vLogits.shape[2]]),
+        sleeping,
+        'dense'
+      );
+
+      return { pitchLogits: pLogits, volumeLogits: vLogits, states: [sA, sB] };
+    });
+  }
 }
 
