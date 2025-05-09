@@ -1,4 +1,118 @@
-import * as tf from '@tensorflow/tfjs';
+// import * as tf from '@tensorflow/tfjs';
+
+class ModernHopfieldLayer extends tf.layers.Layer {
+  constructor(config) {
+    super(config);
+    this.dim         = config.dim;
+    this.maxMemory  = config.maxMemory || 1024;
+    this.beta       = config.beta || 1.0;
+
+    // 1) Preallocate fixed-shape buffers for keys & values:
+    this.keysVar   = this.addWeight(
+      'keys', [this.maxMemory, this.dim], 'float32',
+      tf.initializers.zeros(), undefined, true
+    );
+    this.valuesVar = this.addWeight(
+      'values', [this.maxMemory, this.dim], 'float32',
+      tf.initializers.zeros(), undefined, true
+    );
+
+    // 2) Track how many patterns have been stored so far
+    this.memSize   = 0;
+    // 3) And an insertion index (for ring-buffer style)
+    this.insertIdx = 0;
+  }
+
+  call([input]) {
+    return tf.tidy(() => {
+      const x = input;          // [B, D]
+
+      // If empty memory, no recall—just write and return zeros
+      if (this.memSize === 0) {
+        this._writeMemory(x, x);
+        return tf.zerosLike(x);
+      }
+
+      // 4) Compute attention-based recall:
+      // [B, N] = x [B,D] · keys^T [D,N]
+      const scores = tf.matMul(x, this.keysVar.read(), false, true)
+                         .mul(this.beta);
+      const p      = tf.softmax(scores, 1);      // [B, N]
+      const recall = tf.matMul(p, this.valuesVar.read()); // [B, D]
+
+      // 5) Append new patterns:
+      this._writeMemory(x, x);
+
+      return recall;
+    });
+  }
+
+  _writeMemory(newKeys, newValues) {
+    const B = newKeys.shape[0];
+    // Compute the wrap‑around indices
+    const endIdx = Math.min(this.insertIdx + B, this.maxMemory);
+    const sliceSize = endIdx - this.insertIdx;
+
+    // 1) Write first chunk
+    this.keysVar.write(
+      this.keysVar.read()
+        .slice([0,0], [this.maxMemory, this.dim])
+        .pad([[0,0],[0,0]]), // no-op, just to illustrate slicing
+      // overwrite rows [insertIdx : endIdx]
+      [[this.insertIdx, sliceSize, 0, this.dim]],
+      newKeys.slice([0,0],[sliceSize, this.dim])
+    );
+    this.valuesVar.write(
+      this.valuesVar.read(),
+      [[this.insertIdx, sliceSize, 0, this.dim]],
+      newValues.slice([0,0],[sliceSize, this.dim])
+    );
+
+    // 2) If B > space left, wrap and write remaining at front
+    if (sliceSize < B) {
+      const rem = B - sliceSize;
+      this.keysVar.write(
+        this.keysVar.read(),
+        [[0, rem, 0, this.dim]],
+        newKeys.slice([sliceSize,0],[rem, this.dim])
+      );
+      this.valuesVar.write(
+        this.valuesVar.read(),
+        [[0, rem, 0, this.dim]],
+        newValues.slice([sliceSize,0],[rem, this.dim])
+      );
+      this.insertIdx = rem;
+    } else {
+      this.insertIdx = endIdx % this.maxMemory;
+    }
+
+    // Update memSize (capped to maxMemory)
+    this.memSize = Math.min(this.memSize + B, this.maxMemory);
+  }
+
+  static get className() {
+    return 'ModernHopfieldLayer';
+  }
+}
+tf.serialization.registerClass(ModernHopfieldLayer);
+
+class MeanLayer extends tf.layers.Layer {
+  constructor(axes, config) {
+    super(config);
+    this.axes = axes;
+  }
+  // Adjust the output shape by setting reduced dims to 1
+  computeOutputShape(inputShape) {
+    const outShape = inputShape.slice();
+    this.axes.forEach(ax => { outShape[ax] = 1; });
+    return outShape;
+  }
+  call([input]) {
+    return tf.mean(input, this.axes);
+  }
+  static get className() { return 'MeanLayer'; }
+}
+tf.serialization.registerClass(MeanLayer);
 
 class RNNBlock extends tf.layers.Layer {
   constructor(dModel, nHeads, kwargs) {
@@ -24,7 +138,7 @@ class RNNBlock extends tf.layers.Layer {
     this.ln2 = tf.layers.layerNormalization({ axis: -1 });
 
     // Initialize recurrent state buffer
-    this.state = tf.variable(tf.zeros([nHeads, this.headDim, this.headDim]));
+    this.state = tf.variable(tf.zeros([1, nHeads, this.headDim, this.headDim]));
   }
 
   build(inputShape) { super.build(inputShape); }
@@ -45,11 +159,12 @@ class RNNBlock extends tf.layers.Layer {
     // 3) WKV‐style recurrent update
     // decay: state ← state * γ
     const γ = this.gamma.read().reshape([1, this.nHeads, this.headDim, 1]);
-    let state = prevState.mul(γ);
+    let state = prevState.reshape([1, this.nHeads, this.headDim, this.headDim]);
+    state = state.mul(γ);
     // outer(k, v): [batch, heads, headDim, 1] × [batch, heads, 1, headDim]
     const k_h = kh.reshape([batchSize, this.nHeads, this.headDim, 1]);
     const v_h = vh.reshape([batchSize, this.nHeads, 1, this.headDim]);
-    state = state.add(tf.einsum('bhid,bhjd->bhij', k_h, v_h));
+    state = state.add(k_h.mul(v_h));
 
     // attention‐like output: o = (state ⋅ q) over last dim
     const q_h = qh.reshape([batchSize, this.nHeads, this.headDim, 1]);
@@ -60,7 +175,7 @@ class RNNBlock extends tf.layers.Layer {
     const x2 = this.ln2.apply(x.add(attnOut));
     const gateMlpin = x2.dot(this.gateW.read());
     const [gate, mlpIn] = tf.split(gateMlpin, 2, -1);
-    const mlpOut = tf.mul(tf.silu(mlpIn), tf.sigmoid(gate)).dot(this.downW.read());
+    const mlpOut = tf.mul(mlpIn * tf.sigmoid(mlpIn), tf.sigmoid(gate)).dot(this.downW.read());
 
     const out = tf.addN([x, attnOut, mlpOut]);
     return [out, state];
@@ -68,6 +183,10 @@ class RNNBlock extends tf.layers.Layer {
 
   getConfig() {
     return { dModel: this.dModel, nHeads: this.nHeads };
+  }
+
+  static get className() {
+    return 'RNNBlock';
   }
 }
 tf.serialization.registerClass(RNNBlock);
@@ -81,11 +200,11 @@ export function buildGestureToMIDI(config) {
 
   // 2) Recurrent state inputs remain fixed by heads × latentDim²
   const audioStateIn = tf.input({
-    shape: [config.nAudioHeads, config.latentDim, config.latentDim],
+    shape: [config.nAudioHeads, config.latentDim],
     name: 'audio_state'
   });
   const videoStateIn = tf.input({
-    shape: [config.nVideoHeads, config.latentDim, config.latentDim],
+    shape: [config.nVideoHeads, config.latentDim],
     name: 'video_state'
   });
 
@@ -96,15 +215,15 @@ export function buildGestureToMIDI(config) {
     strides: [1, 2, 2],
     padding: 'same'
   }).apply(videoIn);
-  v = tf.relu(v);
+  v = tf.layers.reLU().apply(v);
   v = tf.layers.conv3d({
     filters: config.videoChannels * 2,
     kernelSize: 3,
     padding: 'same'
   }).apply(v);
-  v = tf.relu(v);
+  v = tf.layers.reLU().apply(v);
   // mean over depth, height, width
-  v = tf.mean(v, [1, 2, 3]);
+  v = new MeanLayer([1,2,3]).apply(v);
   v = tf.layers.dense({ units: config.latentDim, name: 'cross_modal' }).apply(v);
 
   // 4) Video recurrent core
@@ -118,15 +237,15 @@ export function buildGestureToMIDI(config) {
     kernelSize: 5,
     padding: 'same'
   }).apply(audioIn);
-  a = tf.relu(a);
+  a = tf.layers.reLU().apply(a);
   a = tf.layers.conv1d({
     filters: config.audioChannels * 2,
     kernelSize: 3,
     padding: 'same'
   }).apply(a);
-  a = tf.relu(a);
+  a = tf.layers.reLU().apply(a);
   // mean over time
-  a = tf.mean(a, [1]);
+  v = new MeanLayer([1]).apply(v);
   a = tf.layers.dense({ units: config.latentDim }).apply(a);
 
   // 6) Audio recurrent core
@@ -134,10 +253,9 @@ export function buildGestureToMIDI(config) {
     config.latentDim, config.nAudioHeads
   ).apply([a, audioStateIn]);
 
-  // 7) Cross‐modal fusion with Hopfield TODO
-  // const hop = hopfield(videoLatent);
+  const recall = new ModernHopfieldLayer({ dim: config.latentDim }).apply(videoLatent);
 
-  const latent = videoLatent; // tf.add(videoLatent, hop);
+  const latent = tf.layers.average().apply([videoLatent, recall]);
 
   // 8) Output heads
   const noteLogits = tf.layers.dense({ units: config.notes.length })

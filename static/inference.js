@@ -63,8 +63,8 @@ export async function createGestureMidiRunner(config) {
     // Dummy forward to initialize weights
     const audioDummy = tf.zeros([1, 1, 1]);
     const videoDummy = tf.zeros([1, 1, 1, 1, 3]);
-    const audioStateDummy = tf.zeros([1, config.nAudioHeads, config.latentDim, config.latentDim]);
-    const videoStateDummy = tf.zeros([1, config.nVideoHeads, config.latentDim, config.latentDim]);
+    const audioStateDummy = tf.zeros([1, config.nAudioHeads, config.latentDim]);
+    const videoStateDummy = tf.zeros([1, config.nVideoHeads, config.latentDim]);
     model.predict([audioDummy, videoDummy, audioStateDummy, videoStateDummy]);
 
     // 3) Save fresh model to IndexedDB
@@ -84,8 +84,6 @@ export async function createGestureMidiRunner(config) {
   // 5) Initialize recurrent states
   let audioState = tf.zeros([1, config.nAudioHeads, config.latentDim, config.latentDim]);
   let videoState = tf.zeros([1, config.nVideoHeads, config.latentDim, config.latentDim]);
-
-  const crossModalLayer = model.getLayer('cross_modal');
 
   /** Performs one inference + plasticity step, returns logits */
   async function step(audioFrame, videoFrame) {
@@ -107,6 +105,7 @@ export async function createGestureMidiRunner(config) {
 
       // Hebbian update on your cross-modal projection W_cp:
       // pre-synaptic = audioLatent_t1, post-synaptic = videoLatent_t1
+      const W_cp = model.getLayer('cross_modal').kernel;
       const ΔW_cp = tf.outerProduct(e_latent.flatten(), audioLatent_t1.flatten()).mul(η)
         .sub(W_cp.mul(α));
       // (plus any variance regularizer if you keep it)

@@ -64,34 +64,6 @@
   <script type="module">
     import {createGestureMidiRunner} from '/inference.js';
 
-    async function startMedia() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-        videoEl.srcObject = stream;
-        return stream;
-      } catch (err) {
-        let msg;
-        switch (err.name) {
-          case 'NotAllowedError':
-            msg = 'Permission denied: please allow camera/microphone access.';
-            break;
-          case 'NotFoundError':
-            msg = 'No camera or microphone found on this device.';
-            break;
-          case 'NotReadableError':
-            msg = 'Hardware error: camera or microphone is not accessible.';
-            break;
-          case 'OverconstrainedError':
-            msg = 'Constraints cannot be satisfied by available devices.';
-            break;
-          default:
-            msg = `Unexpected error: ${err.message}`;
-        }
-        console.error(`getUserMedia error (${err.name}): ${err.message}`);
-        alert(msg);
-      }
-    }
-
     let midiAccess, currentOutput = null;
     const midiSelect = document.getElementById('midiSelect');
     let synth = new Tone.Synth().toDestination();
@@ -111,7 +83,7 @@
       // Clear old options
       midiSelect.innerHTML = '<option value="builtin">Built-in Synthesizer</option>';
       // Add each hardware output
-      if(midiAccess) {
+      if (midiAccess) {
         for (let output of midiAccess.outputs.values()) {
           const opt = document.createElement('option');
           opt.value = output.id;
@@ -133,7 +105,7 @@
 
     document.getElementById('saveSettings').addEventListener('click', () => {
       bootstrap.Modal.getInstance(settingsModalEl).hide();
-      if(currentOutput && currentOutput === 'builtin') {
+      if (currentOutput && currentOutput === 'builtin') {
         synth = new Tone.Synth().toDestination();
       }
       else {
@@ -157,7 +129,7 @@
 
     (async () => {
       // 1) Set up media streams
-      const stream = await startMedia();
+      const stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
       await initMIDI();
       const videoEl = document.getElementById('video');
       videoEl.srcObject = stream;
@@ -175,7 +147,15 @@
       const vctx = vcanvas.getContext('2d');
 
       // 4) Load the TF.js runner
-      const runner = await createGestureMidiRunner('/models/gesture_to_midi/model.json');
+      const runner = await createGestureMidiRunner({
+        audioChannels: 5,
+        videoChannels: 5,
+        nAudioHeads: 8,
+        nVideoHeads: 8,
+        latentDim: 64,
+        notes: [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71],
+        velocities: [0, 30, 60, 90, 120]
+      });
 
       let latestAudioBuffer = null;
       // On each audio process, capture PCM float32 data
